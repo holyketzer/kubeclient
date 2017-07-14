@@ -429,6 +429,7 @@ client.get_pod_log('pod-name', 'default', previous: true)
 # => "..."
 ```
 
+#### Stream the logs of a pod
 You can also watch the logs of a pod to get a stream of data:
 
 ```ruby
@@ -437,6 +438,73 @@ watcher.each do |line|
   puts line
 end
 ```
+
+Note that it is not safe to use streaming with Web-servers like this:
+
+```ruby
+class SomeController < ApplicationController
+  def stream_logs
+    response.headers['Content-Type'] = 'text/event-stream'
+
+    watcher = client.watch_pod_log('pod_name', 'namespace')
+    watcher.each do |line|
+      response.stream.write("#{line}\n")
+    end
+  rescue ActionController::Live::ClientDisconnected
+    Rails.logger.info("Streaming logs for cluster##{cluster.id} is done")
+  ensure
+    response.stream.close
+  end
+end
+```
+
+Because watcher reads log with blocking socket, and even if Web-client is disconnected Web-server thread still will be blocked until new logs data arrives, and if new data never arrives you will have resource leaking: one server thread and one socket which is connected to Kubernetes server.
+
+Right way to stream logs with Web-servers:
+
+```ruby
+class SomeController < ApplicationController
+  STREAMING_PING_INTERVAL = 10
+
+  def stream_logs
+    response.headers['Content-Type'] = 'text/event-stream'
+
+    watcher = client.watch_pod_log('pod_name', 'namespace')
+
+    watcher_thread = Thread.new do
+      handle_stream_errors(response, watcher_thread) do
+        watcher.each do |line|
+          response.stream.write("#{line}\n")
+        end
+      end
+    end
+
+    handle_stream_errors(response, watcher_thread) do
+      loop do
+        # Allow watcher thread to execute
+        watcher_thread.join(STREAMING_PING_INTERVAL)
+
+        # Check that conection is alive
+        response.stream.write("ping\n")
+      end
+    end
+  end
+
+  def handle_stream_errors(response, thread, &block)
+    block.call
+  rescue IOError, ActionController::Live::ClientDisconnected
+    Rails.logger.info("Streaming is done")
+  ensure
+    if !response.stream.closed?
+      response.stream.close
+      thread.exit
+      Rails.logger.info("Response stream closed, watcher thread stopped")
+    end
+  end
+end
+```
+
+You have to handle ping's on Web-client side. If web-client side is disconnected writing to stream will raise error, close stream and stop thread with watcher.
 
 #### Process a template
 Returns a processed template containing a list of objects to create.

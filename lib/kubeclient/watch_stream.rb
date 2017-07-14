@@ -29,6 +29,8 @@ module Kubeclient
         end
       rescue IOError
         raise unless @finished
+      ensure
+        finish
       end
 
       def finish
